@@ -3,19 +3,19 @@ set -Eeuo pipefail
 
 # ------------- Parameters -------------
 DEST_DIR="${1:-}"                         # destination directory for archives
-NS_PREFIX="${NS_PREFIX:-test)}"            # namespace prefix to scan (env var)
+NS_PREFIX="${NS_PREFIX:-test}"            # namespace prefix to scan (env var) [fixed typo]
 LOG_DIR="${LOG_DIR:-./logs}"              # logs directory (env var)
 MAX_PARALLEL="${MAX_PARALLEL:-1}"         # 1 = sequential; increase to parallelize
 KUBECTL="${KUBECTL:-kubectl}"
 JQ="${JQ:-jq}"
-IMAGE="${IMAGE:-alpine:3.20}"             # dumper pod image
+IMAGE="${IMAGE:-debian:bookworm-slim}"    # dumper pod image (GNU tar)
 READY_TIMEOUT="${READY_TIMEOUT:-180s}"    # pod Ready timeout
 RETRIES="${RETRIES:-3}"                   # retry count for sensitive ops
 SLEEP_BASE="${SLEEP_BASE:-2}"             # exponential backoff base (seconds)
 
 if [[ -z "$DEST_DIR" ]]; then
   echo "Usage: $0 /path/to/destination-dir"
-  echo "Useful env vars: NS_PREFIX , LOG_DIR, MAX_PARALLEL, IMAGE"
+  echo "Useful env vars: NS_PREFIX, LOG_DIR, MAX_PARALLEL, IMAGE"
   exit 1
 fi
 
@@ -52,6 +52,7 @@ command -v "$KUBECTL" >/dev/null || abort "kubectl not found"
 command -v "$JQ" >/dev/null 2>&1 || abort "jq not found"
 command -v gzip >/dev/null || abort "gzip not found"
 command -v sha256sum >/dev/null || abort "sha256sum not found"
+command -v tar >/dev/null || abort "tar not found"
 
 # ------------- Generic helpers -------------
 # retry N cmd... : run a command with retries and exponential backoff
@@ -126,18 +127,35 @@ dump_one() {
     err "Pod did not become Ready ($ns/$pvc)"; echo "$ns,$pvc,FAILED,pod_not_ready" >> "$REPORT_CSV"; return 1
   fi
 
-  # Stream tar from /mnt
-  if ! retry "$RETRIES" bash -c \
-    "$KUBECTL exec -n '$ns' '$pod' -- sh -c 'tar -C /mnt -czvf - . 2>/dev/null' > '$outfile'"; then
-    err "Dump failed ($ns/$pvc)"; echo "$ns,$pvc,FAILED,exec_tar" >> "$REPORT_CSV"; return 1
+  # Stream tar from /mnt with robust pipeline, write to .part then rename
+  local tmpfile="${outfile}.part"
+
+  if ! retry "$RETRIES" bash -c '
+      set -Eeuo pipefail
+      set -o pipefail
+      '"$KUBECTL"' exec --request-timeout=0 -n '"$ns"' '"$pod"' -- \
+        tar -C /mnt -cf - . \
+      | gzip -1 > "'"$tmpfile"'"
+    '; then
+    err "Dump failed ($ns/$pvc)"
+    echo "$ns,$pvc,FAILED,exec_tar" >> "$REPORT_CSV"
+    return 1
   fi
 
   # Validate archive integrity
-  if ! tar -tvf "$outfile" 2>/dev/null; then
-    err "Corrupted archive: $outfile"; echo "$ns,$pvc,FAILED,corrupt_archive" >> "$REPORT_CSV"; return 1
+  if ! gzip -t "$tmpfile"; then
+    err "Corrupted gzip: $tmpfile"
+    echo "$ns,$pvc,FAILED,gzip_corrupt" >> "$REPORT_CSV"
+    return 1
+  fi
+  if ! tar -tzf "$tmpfile" >/dev/null; then
+    err "Corrupted tar: $tmpfile"
+    echo "$ns,$pvc,FAILED,tar_corrupt" >> "$REPORT_CSV"
+    return 1
   fi
 
-  # Record checksum
+  # Move into place atomically and record checksum
+  mv -f "$tmpfile" "$outfile"
   sha256sum "$outfile" >> "$CHECKSUMS_FILE"
 
   info "OK $outfile"
@@ -207,6 +225,7 @@ else
   export DEST_DIR KUBECTL JQ IMAGE READY_TIMEOUT RETRIES SLEEP_BASE REPORT_CSV CHECKSUMS_FILE
   printf "%s\n" "${WORK[@]}" \
     | xargs -I{} -P "$MAX_PARALLEL" bash -c '
+        set -Eeuo pipefail; set -o pipefail
         IFS=";"; read -r ns pvc <<< "{}";
         dump_one "$ns" "$pvc" || true
       '
