@@ -4,372 +4,276 @@ set -euo pipefail
 ############################
 # User-configurable section
 ############################
+# Namespaces
+NS_PREFIX="${NS_PREFIX:-}"                 # e.g. "team-" (matches team-a, team-b, ...)
+NS_LIST="${NS_LIST:-}"                     # explicit namespaces: 'ns1 ns2' (overrides prefix if set)
+INCLUDE_PVC_REGEX="${INCLUDE_PVC_REGEX:-.*}"   # regex to include PVC names
+EXCLUDE_PVC_REGEX="${EXCLUDE_PVC_REGEX:-}"     # regex to exclude PVC names
 
-# What to back up
-NS_PREFIX="${NS_PREFIX:-}"                 # e.g., "team-" to match team-a, team-b, ...
-NS_LIST="${NS_LIST:-}"                     # space-separated explicit namespaces (overrides prefix if set)
-INCLUDE_PVC_REGEX="${INCLUDE_PVC_REGEX:-.*}" # only PVC names matching this regex
-EXCLUDE_PVC_REGEX="${EXCLUDE_PVC_REGEX:-}"   # skip PVC names matching this regex
+# Where to write (on the node)
+BACKUP_NODE="${BACKUP_NODE:-worker-01}"    # node to pin backup pod (ignored if COLOCATE_MODE=true for a given PVC)
+BACKUP_BASE_PATH="${BACKUP_BASE_PATH:-/data/backups/pvc-archives}"  # hostPath directory on that node
 
-# Where to write on the chosen node
-BACKUP_NODE="${BACKUP_NODE:-worker-01}"    # the node name to pin the dumper pod
-BACKUP_BASE_PATH="${BACKUP_BASE_PATH:-/data/backups/pvc-archives}"  # base path on that node
+# Behavior
+COLOCATE_MODE="${COLOCATE_MODE:-true}"     # if true and PVC is RWO+Bound+mounted, run on the app’s node instead
+STRICT_RWO_CHECK="${STRICT_RWO_CHECK:-true}"  # if true, skip RWO PVCs that are mounted on another node (when COLOCATE_MODE=false)
+KEEP_POD="${KEEP_POD:-false}"
+DRY_RUN="${DRY_RUN:-false}"
 
-# Archive options
-PART_SIZE="${PART_SIZE:-1G}"               # e.g., 1G, 2G, 5G
-COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-1}"# gzip 1..9
-EXCLUDES="${EXCLUDES:-lost+found}"         # space-separated paths relative to PVC root to exclude
-
-# Image containing tar/gzip/split/sha256sum
-IMAGE="${IMAGE:-debian:bookworm-slim}"
+# Archiving
+COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-1}"   # gzip level (1..9)
+EXCLUDES="${EXCLUDES:-lost+found}"            # space-separated paths relative to the PVC root
+IMAGE="${IMAGE:-debian:bookworm-slim}"        # must have tar, gzip, coreutils, sha256sum, jq
 
 # Timeouts
 CREATE_TIMEOUT="${CREATE_TIMEOUT:-300s}"   # wait for pod Ready
-RUN_TIMEOUT="${RUN_TIMEOUT:-0}"            # 0=no timeout, else e.g., 8h
+RUN_TIMEOUT="${RUN_TIMEOUT:-0}"            # 0=no timeout (else e.g. 8h)
 
 # Reporting
 REPORT_DIR="${REPORT_DIR:-./reports}"
 LOG_DIR="${LOG_DIR:-${REPORT_DIR}/logs}"
 CSV_PATH="${CSV_PATH:-${REPORT_DIR}/backup_report.csv}"
-
-# Behavior knobs
-# - strict RWO: if true, refuse to attempt backup when PVC is RWO and currently mounted by another pod.
-STRICT_RWO_CHECK="${STRICT_RWO_CHECK:-true}"
-
-# - colocate mode: for RWO PVCs currently used by a pod, attempt to run dumper on that pod's node.
-#   This overrides BACKUP_NODE per-PVC when possible. Requires list/watch permission on pods.
-COLOCATE_MODE="${COLOCATE_MODE:-true}"
-
-# Keep dumper pods around for re-copying?
-KEEP_POD="${KEEP_POD:-false}"
-
-# dry run: list what would be backed up and where, but do not run pods
-DRY_RUN="${DRY_RUN:-false}"
-
 ############################
 # End user-configurable
 ############################
 
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
+need kubectl
+need jq
 mkdir -p "$REPORT_DIR" "$LOG_DIR"
-DATE_TAG="$(date +%Y%m%d-%H%M%S)"
-echo "Started: $(date -Iseconds)"
-echo "Reports: $REPORT_DIR"
-echo "Logs:    $LOG_DIR"
-echo "CSV:     $CSV_PATH"
-echo
 
-# CSV header
-if [[ ! -f "$CSV_PATH" ]]; then
-  echo "date,namespace,pvc,storageClass,accessModes,capacity,phase,result,detail,backup_node,hostpath,archive_prefix,parts,count_bytes,checksum_ok" > "$CSV_PATH"
-fi
+stamp() { date -Iseconds; }
+append_csv_header() {
+  if [[ ! -s "$CSV_PATH" ]]; then
+    echo "date,namespace,pvc,storageClass,accessModes,capacity,phase,result,detail,backup_node,hostpath,archive_file,bytes,checksum_ok" >"$CSV_PATH"
+  fi
+}
+append_csv() {
+  echo "$1" >> "$CSV_PATH"
+}
 
-kget() { kubectl get "$@"; }
-kjson() { kubectl get "$1" "$2" -n "$3" -o json; }
-
-# Discover namespaces
 discover_namespaces() {
   if [[ -n "$NS_LIST" ]]; then
-    echo "$NS_LIST"
-    return
+    for ns in $NS_LIST; do echo "$ns"; done
+  elif [[ -n "$NS_PREFIX" ]]; then
+    kubectl get ns -o json | jq -r --arg p "$NS_PREFIX" '.items[].metadata.name | select(startswith($p))'
+  else
+    kubectl get ns -o json | jq -r '.items[].metadata.name'
   fi
-  if [[ -z "$NS_PREFIX" ]]; then
-    echo "ERROR: Set NS_PREFIX or NS_LIST" >&2
-    exit 1
-  fi
-  kget ns -o json | jq -r '.items[].metadata.name' | grep -E "^${NS_PREFIX}" || true
 }
 
-# For each PVC, we’ll gather metadata
 list_pvcs_json() {
-  local ns="$1"
-  kget pvc -n "$ns" -o json
+  local ns=$1
+  kubectl -n "$ns" get pvc -o json
 }
 
-# Determine node to run on:
-# - If COLOCATE_MODE=true and PVC is RWO and mounted by a pod, return that pod's node.
-# - Else return BACKUP_NODE.
-decide_node_for_pvc() {
-  local ns="$1" pvc="$2" access="$3"
-  local node="$BACKUP_NODE"
-  if [[ "$COLOCATE_MODE" == "true" && "$access" =~ ReadWriteOnce ]]; then
-    # Find a pod mounting this PVC
-    local pod_and_node
-    pod_and_node="$(kubectl -n "$ns" get pod -o json \
-      | jq -r --arg pvc "$pvc" '
-        .items[]
-        | {name: .metadata.name, node: .spec.nodeName, vols: (.spec.volumes // [])}
-        | select(.vols[]? | .persistentVolumeClaim? .claimName == $pvc)
-        | "\(.name)|\(.node)"' | head -n1 || true)"
-    if [[ -n "$pod_and_node" && "$pod_and_node" == *"|"* ]]; then
-      node="${pod_and_node##*|}"
-    fi
+pvc_mount_info() {
+  # prints: phase mounted_nodes(joined by + or - if none)
+  local ns=$1 pvc=$2
+  # find mounted nodes via pods using the PVC
+  local pods nodes
+  pods=$(kubectl -n "$ns" get pod -o json \
+    | jq -r --arg pvc "$pvc" '.items[]
+      | select(.spec.volumes[]? | (.persistentVolumeClaim? // empty) | .claimName==$pvc)
+      | .metadata.name')
+  if [[ -n "$pods" ]]; then
+    nodes=$(kubectl -n "$ns" get pod -o json \
+      | jq -r --arg pvc "$pvc" '.items[]
+        | select(.spec.volumes[]? | (.persistentVolumeClaim? // empty) | .claimName==$pvc)
+        | (.spec.nodeName // "-")' | sort -u | paste -sd+ -)
+  else
+    nodes="-"
   fi
-  echo "$node"
-}
-
-# Build exclude args
-build_exclude_args() {
-  local arr=()
-  if [[ -n "${EXCLUDES:-}" ]]; then
-    # shellcheck disable=SC2206
-    local ex=($EXCLUDES)
-    for e in "${ex[@]}"; do arr+=( "--exclude=$e" ); done
-  fi
-  printf '%s\n' "${arr[@]}"
-}
-
-# Create and run dumper pod for one PVC
-backup_one_pvc() {
-  local ns="$1" pvc="$2" sc="$3" access="$4" capacity="$5"
-
-  # Filters
-  if [[ -n "$INCLUDE_PVC_REGEX" && ! "$pvc" =~ $INCLUDE_PVC_REGEX ]]; then
-    echo "[$ns/$pvc] skip (does not match INCLUDE_PVC_REGEX)" >&2
-    return 0
-  fi
-  if [[ -n "$EXCLUDE_PVC_REGEX" && "$pvc" =~ $EXCLUDE_PVC_REGEX ]]; then
-    echo "[$ns/$pvc] skip (matches EXCLUDE_PVC_REGEX)" >&2
-    return 0
-  fi
-
-  # Check if PVC is Bound and if mounted elsewhere when RWO
   local phase
-  phase="$(kjson pvc "$pvc" "$ns" | jq -r '.status.phase')"
-  if [[ "$phase" != "Bound" ]]; then
-    append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "skip" "PVC not Bound" "-" "-" "-" "-" "-" "-"
-    return 0
-  fi
+  phase=$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.status.phase}')
+  echo "$phase $nodes"
+}
 
-  # For RWO, check active mounts
-  if [[ "$STRICT_RWO_CHECK" == "true" && "$access" =~ ReadWriteOnce ]]; then
-    local mounts
-    mounts="$(kubectl -n "$ns" get pod -o json \
-      | jq -r --arg pvc "$pvc" '
-        .items[]
-        | select((.status.phase!="Failed") and (.status.phase!="Succeeded"))
-        | select(.spec.volumes[]? .persistentVolumeClaim? .claimName == $pvc)
-        | .metadata.name' || true)"
-    if [[ -n "$mounts" ]]; then
-      append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "skipped-RWO-in-use" "Mounted by pod(s): $(echo "$mounts" | tr '\n' ',')" "-" "-" "-" "-" "-" "-"
-      echo "[$ns/$pvc] RWO and mounted by: $(echo "$mounts" | tr '\n' ' '), skipping (STRICT_RWO_CHECK=true)" >&2
-      return 0
-    fi
-  fi
+pod_manifest() {
+  local ns=$1 pvc=$2 node=$3 host_dir=$4 archive_prefix=$5
+  # Build excludes array for tar
+  local excludes_arr=""
+  for e in $EXCLUDES; do excludes_arr="$excludes_arr --exclude='./$e'"; done
 
-  local node chosen_node host_dir archive_prefix log_file manifest tmpfile
-  chosen_node="$(decide_node_for_pvc "$ns" "$pvc" "$access")"
-  node="$chosen_node"
-  host_dir="${BACKUP_BASE_PATH}/out/${ns}/${pvc}/${DATE_TAG}"
-  archive_prefix="${DATE_TAG}-${pvc}"
-  log_file="${LOG_DIR}/${ns}__${pvc}__${DATE_TAG}.log"
-  manifest="$(mktemp)"; tmpfile="$(mktemp)"
-
-  echo "[$ns/$pvc] node=$node hostPath=$host_dir" | tee -a "$log_file"
-
-  if [[ "$DRY_RUN" == "true" ]]; then
-    append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "planned" "dry-run" "$node" "$host_dir" "$archive_prefix" "-" "-" "-"
-    rm -f "$manifest" "$tmpfile"
-    return 0
-  fi
-
-  # Build dumper pod manifest
-  local excludes_arr; mapfile -t excludes_arr < <(build_exclude_args)
-  {
-    cat <<YAML
+  cat <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: dump-${ns//[^a-z0-9-]/-}-${pvc//[^a-z0-9-]/-}-${DATE_TAG}
-  namespace: ${ns}
+  name: "pvc-backup-${pvc//[^a-z0-9-]/-}"
+  namespace: "$ns"
   labels:
     app: pvc-backup
-    pvc: ${pvc}
-    run: ${DATE_TAG}
 spec:
-  nodeName: ${node}
   restartPolicy: Never
-  containers:
-    - name: dumper
-      image: ${IMAGE}
-      securityContext:
-        runAsUser: 0
-      env:
-        - { name: PART_SIZE, value: "${PART_SIZE}" }
-        - { name: ARCHIVE_PREFIX, value: "${archive_prefix}" }
-        - { name: COMPRESSION_LEVEL, value: "${COMPRESSION_LEVEL}" }
-      command:
-        - bash
-        - -ceu
-        - |
-          mkdir -p /backup/out
-          TMP_PREFIX="/backup/out/.${archive_prefix}.part"
-          FINAL_PREFIX="/backup/out/${archive_prefix}.part"
-          # prepare excludes
-          declare -a EXCLUDES_ARR
-YAML
-    if ((${#excludes_arr[@]})); then
-      for ex in "${excludes_arr[@]}"; do
-        printf '          EXCLUDES_ARR+=( "%s" )\n' "$ex"
-      done
-    else
-      echo '          EXCLUDES_ARR=()'
-    fi
-    cat <<'YAML'
-          # Stream, compress, split
-          tar -C /src "${EXCLUDES_ARR[@]}" -cf - . \
-          | gzip -"${COMPRESSION_LEVEL}" \
-          | split -b "${PART_SIZE}" -d -a 4 - "${TMP_PREFIX}."
-
-          # Checksums
-          ( cd /backup/out && sha256sum "$(basename "${TMP_PREFIX}")".* > ".parts.sha256.tmp" )
-
-          # Move to final names atomically
-          for f in /backup/out/."${ARCHIVE_PREFIX}".part.*; do
-            mv "$f" "/backup/out/${ARCHIVE_PREFIX}.part.${f##*.}"
-          done
-          mv "/backup/out/.parts.sha256.tmp" "/backup/out/${ARCHIVE_PREFIX}.parts.sha256"
-
-          # Integrity test of gzip stream (concatenate parts)
-          cat /backup/out/${ARCHIVE_PREFIX}.part.* | gzip -t
-
-          # Collect simple stats
-          COUNT_PARTS=$(ls -1 /backup/out/${ARCHIVE_PREFIX}.part.* | wc -l)
-          COUNT_BYTES=$(du -cb /backup/out/${ARCHIVE_PREFIX}.part.* | tail -1 | awk '{print $1}')
-          echo "{\"parts\":${COUNT_PARTS},\"bytes\":${COUNT_BYTES}}" > /backup/out/${ARCHIVE_PREFIX}.meta.json
-
-          echo "OK"
-      volumeMounts:
-        - name: src
-          mountPath: /src
-          readOnly: true
-        - name: backup
-          mountPath: /backup
+  nodeName: "$node"
+  tolerations:
+  - operator: "Exists"
   volumes:
+  - name: src
+    persistentVolumeClaim:
+      claimName: "$pvc"
+  - name: out
+    hostPath:
+      path: "$host_dir"
+      type: DirectoryOrCreate
+  containers:
+  - name: archiver
+    image: "$IMAGE"
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      readOnlyRootFilesystem: true
+    env:
+    - name: ARCHIVE_PREFIX
+      value: "$archive_prefix"
+    - name: COMPRESSION_LEVEL
+      value: "$COMPRESSION_LEVEL"
+    - name: EXCLUDES_ARGS
+      value: "$excludes_arr"
+    volumeMounts:
     - name: src
-      persistentVolumeClaim:
-        claimName: ${pvc}
-        readOnly: true
-    - name: backup
-      hostPath:
-        path: ${host_dir}
-        type: DirectoryOrCreate
-YAML
-  } > "$manifest"
+      mountPath: /src
+      readOnly: true
+    - name: out
+      mountPath: /backup/out
+    command: ["bash","-ceu","--"]
+    args:
+    - |
+      set -euo pipefail
+      : \"Run timeout (seconds) handled by outer kubectl if set\"
 
-  local pod="dump-${ns//[^a-z0-9-]/-}-${pvc//[^a-z0-9-]/-}-${DATE_TAG}"
+      mkdir -p /backup/out
+      TMP_FILE=\"/backup/out/.${ARCHIVE_PREFIX}.tar.gz\"
+      FINAL_FILE=\"/backup/out/${ARCHIVE_PREFIX}.tar.gz\"
+      TMP_SHA=\"/backup/out/.${ARCHIVE_PREFIX}.tar.gz.sha256.tmp\"
+      FINAL_SHA=\"/backup/out/${ARCHIVE_PREFIX}.tar.gz.sha256\"
+      META=\"/backup/out/${ARCHIVE_PREFIX}.meta.json\"
 
-  # Apply and wait
-  if ! kubectl -n "$ns" apply -f "$manifest" >/dev/null 2>&1; then
-    append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "error" "kubectl apply failed" "$node" "$host_dir" "$archive_prefix" "-" "-" "-"
-    echo "[$ns/$pvc] ERROR applying manifest" | tee -a "$log_file"
-    rm -f "$manifest" "$tmpfile"; return 0
-  fi
+      # Create archive to a hidden temp file, then atomically rename
+      tar -C /src ${EXCLUDES_ARGS} -cf - . | gzip -${COMPRESSION_LEVEL} > \"${TMP_FILE}\"
 
-  if ! kubectl -n "$ns" wait --for=condition=Ready "pod/${pod}" --timeout="$CREATE_TIMEOUT" >/dev/null 2>&1; then
-    local desc; desc="$(kubectl -n "$ns" describe pod "$pod" 2>&1 || true)"
-    append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "error" "Pod not Ready: $(firstline "$desc")" "$node" "$host_dir" "$archive_prefix" "-" "-" "-"
-    echo "$desc" >> "$log_file"
-    safe_delete_pod "$ns" "$pod"
-    rm -f "$manifest" "$tmpfile"; return 0
-  fi
+      ( cd /backup/out && sha256sum \"$(basename \"${TMP_FILE}\")\" > \"${TMP_SHA}\" )
+      mv \"${TMP_FILE}\" \"${FINAL_FILE}\"
+      mv \"${TMP_SHA}\"  \"${FINAL_SHA}\"
 
-  # Stream logs to file
-  if [[ "$RUN_TIMEOUT" != "0" ]]; then
-    set +e
-    timeout "$RUN_TIMEOUT" kubectl -n "$ns" logs -f "pod/${pod}" | tee -a "$log_file"
-    local log_rc=$?
-    set -e
-    if [[ $log_rc -ne 0 ]]; then
-      local desc; desc="$(kubectl -n "$ns" describe pod "$pod" 2>&1 || true)"
-      append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "error" "Logs/timeout rc=$log_rc: $(firstline "$desc")" "$node" "$host_dir" "$archive_prefix" "-" "-" "-"
-      echo "$desc" >> "$log_file"
-      safe_delete_pod "$ns" "$pod"
-      rm -f "$manifest" "$tmpfile"; return 0
-    fi
-  else
-    kubectl -n "$ns" logs -f "pod/${pod}" | tee -a "$log_file"
-  fi
+      # Integrity checks
+      gzip -t \"${FINAL_FILE}\"
+      ( cd /backup/out && sha256sum -c \"$(basename \"${FINAL_SHA}\")\" )
 
-  # Check phase
-  local pod_phase; pod_phase="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")"
-  if [[ "$pod_phase" != "Succeeded" ]]; then
-    local desc; desc="$(kubectl -n "$ns" describe pod "$pod" 2>&1 || true)"
-    append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "error" "Pod phase=$pod_phase: $(firstline "$desc")" "$node" "$host_dir" "$archive_prefix" "-" "-" "-"
-    echo "$desc" >> "$log_file"
-    safe_delete_pod "$ns" "$pod"
-    rm -f "$manifest" "$tmpfile"; return 0
-  fi
+      COUNT_BYTES=$(stat -c %s \"${FINAL_FILE}\")
+      printf '{\"parts\":1,\"bytes\":%s,\"file\":\"%s\"}\n' \"$COUNT_BYTES\" \"$(basename \"${FINAL_FILE}\")\" > \"${META}\"
 
-  # Post-run: read stats and verify checksum on the node directory (best-effort)
-  local meta parts bytes checksum_ok detail
-  meta="$(kubectl -n "$ns" exec "$pod" -- bash -ceu 'cat /backup/out/'"$archive_prefix"'.meta.json 2>/dev/null || echo "{}"')"
-  parts="$(echo "$meta" | jq -r '.parts // "-"')"
-  bytes="$(echo "$meta" | jq -r '.bytes // "-"')"
-
-  # Ask the pod to verify checksums once (uses same mount)
-  set +e
-  kubectl -n "$ns" exec "$pod" -- bash -ceu 'cd /backup/out && sha256sum -c '"$archive_prefix"'.parts.sha256' >"$tmpfile" 2>&1
-  local sum_rc=$?
-  set -e
-  if [[ $sum_rc -eq 0 ]]; then
-    checksum_ok="true"; detail="ok"
-  else
-    checksum_ok="false"; detail="sha256 verify failed (see log)"
-    cat "$tmpfile" >> "$log_file"
-  fi
-
-  append_csv "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "ok" "$detail" "$node" "$host_dir" "$archive_prefix" "$parts" "$bytes" "$checksum_ok"
-
-  if [[ "$KEEP_POD" != "true" ]]; then
-    safe_delete_pod "$ns" "$pod"
-  fi
-
-  rm -f "$manifest" "$tmpfile"
+      echo \"OK\"
+EOF
 }
-
-append_csv() {
-  local date ns pvc sc access cap phase result detail node host path parts bytes csum
-  date="$(date -Iseconds)"
-  ns="$1"; pvc="$2"; sc="$3"; access="$4"; cap="$5"; phase="$6"; result="$7"; detail="$8"
-  node="$9"; host="${10}"; path="${11}"; parts="${12}"; bytes="${13}"; csum="${14}"
-  printf '%s,%s,%s,%s,"%s",%s,%s,%s,"%s",%s,%s,%s,%s,%s,%s\n' \
-    "$date" "$ns" "$pvc" "$sc" "$access" "$cap" "$phase" "$result" "$detail" "$node" "$host" "$path" "$parts" "$bytes" "$csum" \
-    >> "$CSV_PATH"
-}
-
-firstline() { echo "$1" | head -n1; }
 
 safe_delete_pod() {
-  local ns="$1" pod="$2"
-  kubectl -n "$ns" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+  kubectl -n "$1" delete pod "$2" --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
+}
+
+backup_one_pvc() {
+  local ns=$1 pvc=$2 sc=$3 access=$4 capacity=$5
+  local phase mounted_nodes; read -r phase mounted_nodes < <(pvc_mount_info "$ns" "$pvc")
+
+  # Decide node
+  local node="$BACKUP_NODE"
+  if [[ "$COLOCATE_MODE" == "true" && "$phase" == "Bound" && "$mounted_nodes" != "-" ]]; then
+    node="${mounted_nodes%%+*}"  # first node using the PVC
+  elif [[ "$STRICT_RWO_CHECK" == "true" && "$access" == "ReadWriteOnce" && "$mounted_nodes" != "-" && "$COLOCATE_MODE" != "true" ]]; then
+    echo "Skip RWO PVC mounted elsewhere: $ns/$pvc on $mounted_nodes"
+    append_csv "$(printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' \
+      "$(stamp)" "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "skipped" "mounted:$mounted_nodes" "-" "-" "-" "-" "-")"
+    return
+  fi
+
+  local date_tag archive_prefix host_dir pod log_file
+  date_tag="$(date +%Y%m%dT%H%M%S)"
+  archive_prefix="${date_tag}-${pvc}"
+  host_dir="${BACKUP_BASE_PATH}/out/${ns}/${pvc}/${date_tag}"
+  pod="pvc-backup-${pvc//[^a-z0-9-]/-}"
+  log_file="${LOG_DIR}/${ns}__${pvc}__${date_tag}.log"
+
+  echo "Backing up $ns/$pvc -> $node:$host_dir"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[DRY RUN] Would create pod on $node and write to $host_dir" | tee -a "$log_file"
+    append_csv "$(printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' \
+      "$(stamp)" "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "dry-run" "-" "$node" "$host_dir" "-" "-" "-")"
+    return
+  fi
+
+  # Ensure parent dir exists on node (hostPath DirectoryOrCreate will do it)
+  safe_delete_pod "$ns" "$pod"
+  pod_manifest "$ns" "$pvc" "$node" "$host_dir" "$archive_prefix" | kubectl apply -f - >/dev/null
+
+  # Wait for Ready
+  if ! kubectl -n "$ns" wait --for=condition=Ready pod/"$pod" --timeout="$CREATE_TIMEOUT" >/dev/null 2>&1; then
+    echo "Pod failed to become Ready for $ns/$pvc" | tee -a "$log_file"
+    append_csv "$(printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' \
+      "$(stamp)" "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "error" "pod-not-ready" "$node" "$host_dir" "-" "-" "-")"
+    safe_delete_pod "$ns" "$pod"; return
+  fi
+
+  # Let the container do the work (command runs on start). Optionally enforce run timeout.
+  set +e
+  if [[ "$RUN_TIMEOUT" != "0" ]]; then
+    kubectl -n "$ns" wait --for=condition=Ready=false --timeout="$RUN_TIMEOUT" pod/"$pod" >/dev/null 2>&1
+  else
+    # Poll until it exits (Succeeded or Failed)
+    kubectl -n "$ns" wait --for=condition=Ready=false --timeout=0s pod/"$pod" >/dev/null 2>&1 || true
+  fi
+  # Collect logs
+  kubectl -n "$ns" logs "$pod" >"$log_file" 2>&1
+  rc=$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null || echo "1")
+  set -e
+
+  # Read meta and verify
+  local meta file bytes checksum_ok detail
+  file="-"; bytes="-"; checksum_ok="-"; detail="-"
+  if [[ "$rc" == "0" ]]; then
+    meta="$(kubectl -n "$ns" exec "$pod" -- sh -ceu 'cat /backup/out/'"$archive_prefix"'.meta.json 2>/dev/null || echo "{}"')"
+    file="$(echo "$meta" | jq -r '.file // "-"')"
+    bytes="$(echo "$meta" | jq -r '.bytes // "-"')"
+    # Checksum already verified inside pod; double-check file existence
+    if kubectl -n "$ns" exec "$pod" -- sh -c '[ -f /backup/out/'"$file"' ]' 2>/dev/null; then
+      checksum_ok="true"; detail="ok"
+    else
+      checksum_ok="false"; detail="archive-missing"
+      rc=1
+    fi
+  else
+    detail="container-exit-$rc"
+  fi
+
+  local result="ok"
+  [[ "$rc" == "0" ]] || result="error"
+
+  append_csv "$(printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' \
+    "$(stamp)" "$ns" "$pvc" "$sc" "$access" "$capacity" "$phase" "$result" "$detail" "$node" "$host_dir" "$file" "$bytes" "$checksum_ok")"
+
+  [[ "$KEEP_POD" == "true" ]] || safe_delete_pod "$ns" "$pod"
 }
 
 main() {
-  local nslist; mapfile -t nslist < <(discover_namespaces)
-  if ((${#nslist[@]}==0)); then
-    echo "No namespaces matched." >&2; exit 0
-  fi
-  echo "Namespaces: ${nslist[*]}"
-  echo
+  append_csv_header
+  mapfile -t nslist < <(discover_namespaces)
+  if ((${#nslist[@]}==0)); then echo "No namespaces matched."; exit 0; fi
 
+  echo "Namespaces: ${nslist[*]}"
   for ns in "${nslist[@]}"; do
-    echo "=== Namespace: $ns ==="
-    local json; json="$(list_pvcs_json "$ns")" || { echo "Cannot list PVCs in $ns" >&2; continue; }
-    # Iterate PVCs
-    mapfile -t pvcs < <(echo "$json" | jq -r '.items[].metadata.name' )
-    if ((${#pvcs[@]}==0)); then
-      echo "No PVCs in $ns"; continue
-    fi
+    echo "==> Namespace: $ns"
+    json="$(list_pvcs_json "$ns")" || { echo "Cannot list PVCs in $ns" >&2; continue; }
+    mapfile -t pvcs < <(echo "$json" | jq -r '.items[].metadata.name')
+    ((${#pvcs[@]})) || { echo "No PVCs in $ns"; continue; }
+
     for pvc in "${pvcs[@]}"; do
-      local sc access cap
+      [[ "$pvc" =~ $INCLUDE_PVC_REGEX ]] || continue
+      [[ -n "$EXCLUDE_PVC_REGEX" && "$pvc" =~ $EXCLUDE_PVC_REGEX ]] && continue
       sc="$(echo "$json" | jq -r --arg pvc "$pvc" '.items[] | select(.metadata.name==$pvc) | (.spec.storageClassName // "-")')"
       access="$(echo "$json" | jq -r --arg pvc "$pvc" '.items[] | select(.metadata.name==$pvc) | (.spec.accessModes | join("+"))')"
       cap="$(echo "$json" | jq -r --arg pvc "$pvc" '.items[] | select(.metadata.name==$pvc) | (.status.capacity.storage // "-")')"
       backup_one_pvc "$ns" "$pvc" "$sc" "$access" "$cap"
     done
-  endtime="$(date -Iseconds)"
-  echo
-  echo "Finished at: $endtime"
+  done
+  echo "Finished at: $(stamp)"
 }
 
 main
