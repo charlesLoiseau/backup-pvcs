@@ -109,7 +109,7 @@ dump_one() {
   local ns="$1" pvc="$2"
   local outdir="$DEST_DIR/$ns"; mkdir -p "$outdir"
   local pod="dump-${pvc//_/--}-$(ts_compact)"; pod="${pod,,}"; pod="${pod//./-}"
-  local outfile="$outdir/${pvc}-$(ts_compact).tar.gz"
+  local outfile="$outdir/${pvc}-$(ts_compact).tgz"
 
   info "Start dump ns=$ns pvc=$pvc pod=$pod -> $outfile"
 
@@ -133,7 +133,7 @@ dump_one() {
   fi
 
   # Validate archive integrity
-  if ! gzip -t "$outfile" 2>/dev/null; then
+  if ! tar -tvf "$outfile" 2>/dev/null; then
     err "Corrupted archive: $outfile"; echo "$ns,$pvc,FAILED,corrupt_archive" >> "$REPORT_CSV"; return 1
   fi
 
