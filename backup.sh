@@ -126,9 +126,9 @@ dump_one() {
     err "Pod did not become Ready ($ns/$pvc)"; echo "$ns,$pvc,FAILED,pod_not_ready" >> "$REPORT_CSV"; return 1
   fi
 
-  # Stream tar from /mnt -> gzip locally (keeps cluster CPU/network usage reasonable)
+  # Stream tar from /mnt
   if ! retry "$RETRIES" bash -c \
-    "$KUBECTL exec -n '$ns' '$pod' -- sh -c 'tar -C /mnt -cf - . 2>/dev/null' | gzip -c > '$outfile'"; then
+    "$KUBECTL exec -n '$ns' '$pod' -- sh -c 'tar -C /mnt -czvf - . 2>/dev/null' > '$outfile'"; then
     err "Dump failed ($ns/$pvc)"; echo "$ns,$pvc,FAILED,exec_tar" >> "$REPORT_CSV"; return 1
   fi
 
