@@ -135,7 +135,7 @@ spec:
       readOnly: true
     - name: out
       mountPath: /backup/out
-    command: ["bash","-ceu","--"]
+    command: ["sh","-ceu","--"]
     args:
     - |
       set -euo pipefail
